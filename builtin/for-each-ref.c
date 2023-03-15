@@ -89,6 +89,8 @@ int cmd_for_each_ref(int argc, const char **argv, const char *prefix)
 		while (strbuf_getline(&line, stdin) != EOF)
 			strvec_push(&vec, line.buf);
 
+		strbuf_release(&line);
+
 		/* vec.v is NULL-terminated, just like 'argv'. */
 		filter.name_patterns = vec.v;
 	} else {
