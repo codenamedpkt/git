@@ -49,6 +49,7 @@ enum {
 
 struct display_state {
 	int refcol_width;
+	int compact_format;
 };
 
 static int fetch_prune_config = -1; /* unspecified */
@@ -745,9 +746,7 @@ out:
 	return ret;
 }
 
-static int compact_format;
-
-static int refcol_width(const struct ref *ref)
+static int refcol_width(const struct ref *ref, int compact_format)
 {
 	int max, rlen, llen, len;
 
@@ -789,9 +788,9 @@ static void display_state_init(struct display_state *display, struct ref *ref_ma
 
 	git_config_get_string_tmp("fetch.output", &format);
 	if (!strcasecmp(format, "full"))
-		compact_format = 0;
+		display->compact_format = 0;
 	else if (!strcasecmp(format, "compact"))
-		compact_format = 1;
+		display->compact_format = 1;
 	else
 		die(_("invalid value for '%s': '%s'"),
 		    "fetch.output", format);
@@ -805,7 +804,7 @@ static void display_state_init(struct display_state *display, struct ref *ref_ma
 		    !strcmp(rm->name, "HEAD"))
 			continue;
 
-		width = refcol_width(rm);
+		width = refcol_width(rm, display->compact_format);
 
 		/*
 		 * Not precise calculation for compact mode because '*' can
@@ -887,7 +886,7 @@ static void format_display(struct display_state *display,
 	width = (summary_width + strlen(summary) - gettext_width(summary));
 
 	strbuf_addf(display_buffer, "%c %-*s ", code, width, summary);
-	if (!compact_format)
+	if (!display->compact_format)
 		print_remote_to_local(display, display_buffer, remote, local);
 	else
 		print_compact(display, display_buffer, remote, local);
