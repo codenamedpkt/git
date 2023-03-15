@@ -49,6 +49,7 @@ enum {
 
 struct display_state {
 	int refcol_width;
+	int summary_width;
 	int compact_format;
 
 	char *url;
@@ -830,6 +831,8 @@ static void display_state_init(struct display_state *display, struct ref *ref_ma
 		if (display->refcol_width < width)
 			display->refcol_width = width;
 	}
+
+	display->summary_width = transport_summary_width(ref_map);
 }
 
 static void display_state_release(struct display_state *display)
@@ -896,8 +899,7 @@ static void print_compact(struct display_state *display, struct strbuf *display_
 static void format_display(struct display_state *display,
 			   struct strbuf *display_buffer, char code,
 			   const char *summary, const char *error,
-			   const char *remote, const char *local,
-			   int summary_width)
+			   const char *remote, const char *local)
 {
 	int width;
 
@@ -909,7 +911,7 @@ static void format_display(struct display_state *display,
 		display->shown_url = 1;
 	}
 
-	width = (summary_width + strlen(summary) - gettext_width(summary));
+	width = (display->summary_width + strlen(summary) - gettext_width(summary));
 
 	strbuf_addf(display_buffer, " %c %-*s ", code, width, summary);
 	if (!display->compact_format)
@@ -925,7 +927,7 @@ static int update_local_ref(struct ref *ref,
 			    struct ref_transaction *transaction,
 			    struct display_state *display,
 			    const char *remote, const struct ref *remote_ref,
-			    struct strbuf *display_buffer, int summary_width)
+			    struct strbuf *display_buffer)
 {
 	struct commit *current = NULL, *updated;
 	int fast_forward = 0;
@@ -936,7 +938,7 @@ static int update_local_ref(struct ref *ref,
 	if (oideq(&ref->old_oid, &ref->new_oid)) {
 		if (verbosity > 0)
 			format_display(display, display_buffer, '=', _("[up to date]"), NULL,
-				       remote, ref->name, summary_width);
+				       remote, ref->name);
 		return 0;
 	}
 
@@ -949,7 +951,7 @@ static int update_local_ref(struct ref *ref,
 		 */
 		format_display(display, display_buffer, '!', _("[rejected]"),
 			       _("can't fetch into checked-out branch"),
-			       remote, ref->name, summary_width);
+			       remote, ref->name);
 		return 1;
 	}
 
@@ -960,12 +962,12 @@ static int update_local_ref(struct ref *ref,
 			r = s_update_ref("updating tag", ref, transaction, 0);
 			format_display(display, display_buffer, r ? '!' : 't', _("[tag update]"),
 				       r ? _("unable to update local ref") : NULL,
-				       remote, ref->name, summary_width);
+				       remote, ref->name);
 			return r;
 		} else {
 			format_display(display, display_buffer, '!', _("[rejected]"),
 				       _("would clobber existing tag"),
-				       remote, ref->name, summary_width);
+				       remote, ref->name);
 			return 1;
 		}
 	}
@@ -998,7 +1000,7 @@ static int update_local_ref(struct ref *ref,
 		r = s_update_ref(msg, ref, transaction, 0);
 		format_display(display, display_buffer, r ? '!' : '*', what,
 			       r ? _("unable to update local ref") : NULL,
-			       remote, ref->name, summary_width);
+			       remote, ref->name);
 		return r;
 	}
 
@@ -1020,7 +1022,7 @@ static int update_local_ref(struct ref *ref,
 		r = s_update_ref("fast-forward", ref, transaction, 1);
 		format_display(display, display_buffer, r ? '!' : ' ', quickref.buf,
 			       r ? _("unable to update local ref") : NULL,
-			       remote, ref->name, summary_width);
+			       remote, ref->name);
 		strbuf_release(&quickref);
 		return r;
 	} else if (force || ref->force) {
@@ -1032,12 +1034,12 @@ static int update_local_ref(struct ref *ref,
 		r = s_update_ref("forced-update", ref, transaction, 1);
 		format_display(display, display_buffer, r ? '!' : '+', quickref.buf,
 			       r ? _("unable to update local ref") : _("forced update"),
-			       remote, ref->name, summary_width);
+			       remote, ref->name);
 		strbuf_release(&quickref);
 		return r;
 	} else {
 		format_display(display, display_buffer, '!', _("[rejected]"), _("non-fast-forward"),
-			       remote, ref->name, summary_width);
+			       remote, ref->name);
 		return 1;
 	}
 }
@@ -1158,10 +1160,6 @@ static int store_updated_refs(struct display_state *display,
 	const char *what, *kind;
 	struct ref *rm;
 	int want_status;
-	int summary_width = 0;
-
-	if (verbosity >= 0)
-		summary_width = transport_summary_width(ref_map);
 
 	if (!connectivity_checked) {
 		struct check_connected_options opt = CHECK_CONNECTED_INIT;
@@ -1266,7 +1264,7 @@ static int store_updated_refs(struct display_state *display,
 			strbuf_reset(&note);
 			if (ref) {
 				rc |= update_local_ref(ref, transaction, display, what,
-						       rm, &note, summary_width);
+						       rm, &note);
 				free(ref);
 			} else if (write_fetch_head || dry_run) {
 				/*
@@ -1277,7 +1275,7 @@ static int store_updated_refs(struct display_state *display,
 				format_display(display, &note, '*',
 					       *kind ? kind : "branch", NULL,
 					       *what ? what : "HEAD",
-					       "FETCH_HEAD", summary_width);
+					       "FETCH_HEAD");
 			}
 			if (note.len)
 				fputs(note.buf, stderr);
@@ -1413,13 +1411,10 @@ static int prune_refs(struct display_state *display,
 	}
 
 	if (verbosity >= 0) {
-		int summary_width = transport_summary_width(stale_refs);
-
 		for (ref = stale_refs; ref; ref = ref->next) {
 			struct strbuf sb = STRBUF_INIT;
 			format_display(display, &sb, '-', _("[deleted]"), NULL,
-				       _("(none)"), ref->name,
-				       summary_width);
+				       _("(none)"), ref->name);
 			fputs(sb.buf, stderr);
 			strbuf_release(&sb);
 			warn_dangling_symref(stderr, dangling_msg, ref->name);
