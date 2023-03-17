@@ -48,6 +48,17 @@ enum {
 	TAGS_SET = 2
 };
 
+struct display_state {
+	struct strbuf buf;
+
+	int refcol_width;
+	int summary_width;
+	int compact_format;
+
+	char *url;
+	int url_len, shown_url;
+};
+
 static int fetch_prune_config = -1; /* unspecified */
 static int fetch_show_forced_updates = 1;
 static uint64_t forced_updates_ms = 0;
@@ -80,7 +91,6 @@ static const char *submodule_prefix = "";
 static int recurse_submodules = RECURSE_SUBMODULES_DEFAULT;
 static int recurse_submodules_cli = RECURSE_SUBMODULES_DEFAULT;
 static int recurse_submodules_default = RECURSE_SUBMODULES_ON_DEMAND;
-static int shown_url = 0;
 static struct refspec refmap = REFSPEC_INIT_FETCH;
 static struct list_objects_filter_options filter_options = LIST_OBJECTS_FILTER_INIT;
 static struct string_list server_options = STRING_LIST_INIT_DUP;
@@ -742,16 +752,13 @@ out:
 	return ret;
 }
 
-static int refcol_width = 10;
-static int compact_format;
-
-static void adjust_refcol_width(const struct ref *ref)
+static int refcol_width(const struct ref *ref, int compact_format)
 {
 	int max, rlen, llen, len;
 
 	/* uptodate lines are only shown on high verbosity level */
 	if (verbosity <= 0 && oideq(&ref->peer_ref->old_oid, &ref->old_oid))
-		return;
+		return 0;
 
 	max    = term_columns();
 	rlen   = utf8_strwidth(prettify_refname(ref->name));
@@ -770,48 +777,79 @@ static void adjust_refcol_width(const struct ref *ref)
 	}
 	len = 21 /* flag and summary */ + rlen + 4 /* -> */ + llen;
 	if (len >= max)
-		return;
+		return 0;
 
-	/*
-	 * Not precise calculation for compact mode because '*' can
-	 * appear on the left hand side of '->' and shrink the column
-	 * back.
-	 */
-	if (refcol_width < rlen)
-		refcol_width = rlen;
+	return rlen;
 }
 
-static void prepare_format_display(struct ref *ref_map)
+static void display_state_init(struct display_state *display, struct ref *ref_map,
+			       const char *raw_url)
 {
 	struct ref *rm;
 	const char *format = "full";
+	int i;
+
+	memset(display, 0, sizeof(*display));
+
+	strbuf_init(&display->buf, 0);
+
+	if (raw_url)
+		display->url = transport_anonymize_url(raw_url);
+	else
+		display->url = xstrdup("foreign");
+
+	display->url_len = strlen(display->url);
+	for (i = display->url_len - 1; display->url[i] == '/' && 0 <= i; i--)
+		;
+	display->url_len = i + 1;
+	if (4 < i && !strncmp(".git", display->url + i - 3, 4))
+		display->url_len = i - 3;
 
 	if (verbosity < 0)
 		return;
 
 	git_config_get_string_tmp("fetch.output", &format);
 	if (!strcasecmp(format, "full"))
-		compact_format = 0;
+		display->compact_format = 0;
 	else if (!strcasecmp(format, "compact"))
-		compact_format = 1;
+		display->compact_format = 1;
 	else
 		die(_("invalid value for '%s': '%s'"),
 		    "fetch.output", format);
 
+	display->refcol_width = 10;
 	for (rm = ref_map; rm; rm = rm->next) {
+		int width;
+
 		if (rm->status == REF_STATUS_REJECT_SHALLOW ||
 		    !rm->peer_ref ||
 		    !strcmp(rm->name, "HEAD"))
 			continue;
 
-		adjust_refcol_width(rm);
+		width = refcol_width(rm, display->compact_format);
+
+		/*
+		 * Not precise calculation for compact mode because '*' can
+		 * appear on the left hand side of '->' and shrink the column
+		 * back.
+		 */
+		if (display->refcol_width < width)
+			display->refcol_width = width;
 	}
+
+	display->summary_width = transport_summary_width(ref_map);
 }
 
-static void print_remote_to_local(struct strbuf *display,
+static void display_state_release(struct display_state *display)
+{
+	strbuf_release(&display->buf);
+	free(display->url);
+}
+
+static void print_remote_to_local(struct display_state *display,
 				  const char *remote, const char *local)
 {
-	strbuf_addf(display, "%-*s -> %s", refcol_width, remote, local);
+	strbuf_addf(&display->buf, "%-*s -> %s", display->refcol_width, remote, local);
 }
 
 static int find_and_replace(struct strbuf *haystack,
@@ -841,14 +879,14 @@ static int find_and_replace(struct strbuf *haystack,
 	return 1;
 }
 
-static void print_compact(struct strbuf *display,
+static void print_compact(struct display_state *display,
 			  const char *remote, const char *local)
 {
 	struct strbuf r = STRBUF_INIT;
 	struct strbuf l = STRBUF_INIT;
 
 	if (!strcmp(remote, local)) {
-		strbuf_addf(display, "%-*s -> *", refcol_width, remote);
+		strbuf_addf(&display->buf, "%-*s -> *", display->refcol_width, remote);
 		return;
 	}
 
@@ -863,34 +901,42 @@ static void print_compact(struct strbuf *display,
 	strbuf_release(&l);
 }
 
-static void format_display(struct strbuf *display, char code,
-			   const char *summary, const char *error,
-			   const char *remote, const char *local,
-			   int summary_width)
+static void display_ref_update(struct display_state *display, char code,
+			       const char *summary, const char *error,
+			       const char *remote, const char *local)
 {
 	int width;
 
 	if (verbosity < 0)
 		return;
 
-	width = (summary_width + strlen(summary) - gettext_width(summary));
+	strbuf_reset(&display->buf);
 
-	strbuf_addf(display, "%c %-*s ", code, width, summary);
-	if (!compact_format)
-		print_remote_to_local(display, remote, local);
+	if (!display->shown_url) {
+		strbuf_addf(&display->buf, _("From %.*s\n"), display->url_len, display->url);
+		display->shown_url = 1;
+	}
+
+	width = (display->summary_width + strlen(summary) - gettext_width(summary));
+
+	strbuf_addf(&display->buf, " %c %-*s ", code, width, summary);
+	if (!display->compact_format)
+		print_remote_to_local(display, remote, prettify_refname(local));
 	else
-		print_compact(display, remote, local);
+		print_compact(display, remote, prettify_refname(local));
 	if (error)
-		strbuf_addf(display, "  (%s)", error);
+		strbuf_addf(&display->buf, "  (%s)", error);
+	strbuf_addch(&display->buf, '\n');
+
+	fputs(display->buf.buf, stderr);
 }
 
 static int update_local_ref(struct ref *ref,
 			    struct ref_transaction *transaction,
-			    const char *remote, const struct ref *remote_ref,
-			    struct strbuf *display, int summary_width)
+			    struct display_state *display,
+			    const char *remote, const struct ref *remote_ref)
 {
 	struct commit *current = NULL, *updated;
-	const char *pretty_ref = prettify_refname(ref->name);
 	int fast_forward = 0;
 
 	if (!repo_has_object_file(the_repository, &ref->new_oid))
@@ -898,8 +944,8 @@ static int update_local_ref(struct ref *ref,
 
 	if (oideq(&ref->old_oid, &ref->new_oid)) {
 		if (verbosity > 0)
-			format_display(display, '=', _("[up to date]"), NULL,
-				       remote, pretty_ref, summary_width);
+			display_ref_update(display, '=', _("[up to date]"), NULL,
+					   remote, ref->name);
 		return 0;
 	}
 
@@ -910,9 +956,9 @@ static int update_local_ref(struct ref *ref,
 		 * If this is the head, and it's not okay to update
 		 * the head, and the old value of the head isn't empty...
 		 */
-		format_display(display, '!', _("[rejected]"),
-			       _("can't fetch into checked-out branch"),
-			       remote, pretty_ref, summary_width);
+		display_ref_update(display, '!', _("[rejected]"),
+				   _("can't fetch into checked-out branch"),
+				   remote, ref->name);
 		return 1;
 	}
 
@@ -921,13 +967,14 @@ static int update_local_ref(struct ref *ref,
 		if (force || ref->force) {
 			int r;
 			r = s_update_ref("updating tag", ref, transaction, 0);
-			format_display(display, r ? '!' : 't', _("[tag update]"),
-				       r ? _("unable to update local ref") : NULL,
-				       remote, pretty_ref, summary_width);
+			display_ref_update(display, r ? '!' : 't', _("[tag update]"),
+					   r ? _("unable to update local ref") : NULL,
+					   remote, ref->name);
 			return r;
 		} else {
-			format_display(display, '!', _("[rejected]"), _("would clobber existing tag"),
-				       remote, pretty_ref, summary_width);
+			display_ref_update(display, '!', _("[rejected]"),
+					   _("would clobber existing tag"),
+					   remote, ref->name);
 			return 1;
 		}
 	}
@@ -958,9 +1005,9 @@ static int update_local_ref(struct ref *ref,
 		}
 
 		r = s_update_ref(msg, ref, transaction, 0);
-		format_display(display, r ? '!' : '*', what,
-			       r ? _("unable to update local ref") : NULL,
-			       remote, pretty_ref, summary_width);
+		display_ref_update(display, r ? '!' : '*', what,
+				   r ? _("unable to update local ref") : NULL,
+				   remote, ref->name);
 		return r;
 	}
 
@@ -980,9 +1027,9 @@ static int update_local_ref(struct ref *ref,
 		strbuf_addstr(&quickref, "..");
 		strbuf_add_unique_abbrev(&quickref, &ref->new_oid, DEFAULT_ABBREV);
 		r = s_update_ref("fast-forward", ref, transaction, 1);
-		format_display(display, r ? '!' : ' ', quickref.buf,
-			       r ? _("unable to update local ref") : NULL,
-			       remote, pretty_ref, summary_width);
+		display_ref_update(display, r ? '!' : ' ', quickref.buf,
+				   r ? _("unable to update local ref") : NULL,
+				   remote, ref->name);
 		strbuf_release(&quickref);
 		return r;
 	} else if (force || ref->force) {
@@ -992,14 +1039,14 @@ static int update_local_ref(struct ref *ref,
 		strbuf_addstr(&quickref, "...");
 		strbuf_add_unique_abbrev(&quickref, &ref->new_oid, DEFAULT_ABBREV);
 		r = s_update_ref("forced-update", ref, transaction, 1);
-		format_display(display, r ? '!' : '+', quickref.buf,
-			       r ? _("unable to update local ref") : _("forced update"),
-			       remote, pretty_ref, summary_width);
+		display_ref_update(display, r ? '!' : '+', quickref.buf,
+				   r ? _("unable to update local ref") : _("forced update"),
+				   remote, ref->name);
 		strbuf_release(&quickref);
 		return r;
 	} else {
-		format_display(display, '!', _("[rejected]"), _("non-fast-forward"),
-			       remote, pretty_ref, summary_width);
+		display_ref_update(display, '!', _("[rejected]"), _("non-fast-forward"),
+				   remote, ref->name);
 		return 1;
 	}
 }
@@ -1109,26 +1156,17 @@ N_("it took %.2f seconds to check forced updates; you can use\n"
    "'--no-show-forced-updates' or run 'git config fetch.showForcedUpdates false'\n"
    "to avoid this check\n");
 
-static int store_updated_refs(const char *raw_url, const char *remote_name,
+static int store_updated_refs(struct display_state *display,
+			      const char *remote_name,
 			      int connectivity_checked,
 			      struct ref_transaction *transaction, struct ref *ref_map,
 			      struct fetch_head *fetch_head)
 {
-	int url_len, i, rc = 0;
+	int rc = 0;
 	struct strbuf note = STRBUF_INIT;
 	const char *what, *kind;
 	struct ref *rm;
-	char *url;
 	int want_status;
-	int summary_width = 0;
-
-	if (verbosity >= 0)
-		summary_width = transport_summary_width(ref_map);
-
-	if (raw_url)
-		url = transport_anonymize_url(raw_url);
-	else
-		url = xstrdup("foreign");
 
 	if (!connectivity_checked) {
 		struct check_connected_options opt = CHECK_CONNECTED_INIT;
@@ -1136,12 +1174,10 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 		opt.exclude_hidden_refs_section = "fetch";
 		rm = ref_map;
 		if (check_connected(iterate_ref_map, &rm, &opt)) {
-			rc = error(_("%s did not send all necessary objects\n"), url);
+			rc = error(_("%s did not send all necessary objects\n"), display->url);
 			goto abort;
 		}
 	}
-
-	prepare_format_display(ref_map);
 
 	/*
 	 * We do a pass for each fetch_head_status type in their enum order, so
@@ -1222,13 +1258,6 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 				what = rm->name;
 			}
 
-			url_len = strlen(url);
-			for (i = url_len - 1; url[i] == '/' && 0 <= i; i--)
-				;
-			url_len = i + 1;
-			if (4 < i && !strncmp(".git", url + i - 3, 4))
-				url_len = i - 3;
-
 			strbuf_reset(&note);
 			if (*what) {
 				if (*kind)
@@ -1238,12 +1267,10 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 
 			append_fetch_head(fetch_head, &rm->old_oid,
 					  rm->fetch_head_status,
-					  note.buf, url, url_len);
+					  note.buf, display->url, display->url_len);
 
-			strbuf_reset(&note);
 			if (ref) {
-				rc |= update_local_ref(ref, transaction, what,
-						       rm, &note, summary_width);
+				rc |= update_local_ref(ref, transaction, display, what, rm);
 				free(ref);
 			} else if (write_fetch_head || dry_run) {
 				/*
@@ -1251,18 +1278,10 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 				 * would be written to FETCH_HEAD, if --dry-run
 				 * is set).
 				 */
-				format_display(&note, '*',
-					       *kind ? kind : "branch", NULL,
-					       *what ? what : "HEAD",
-					       "FETCH_HEAD", summary_width);
-			}
-			if (note.len) {
-				if (!shown_url) {
-					fprintf(stderr, _("From %.*s\n"),
-							url_len, url);
-					shown_url = 1;
-				}
-				fprintf(stderr, " %s\n", note.buf);
+				display_ref_update(display, '*',
+						   *kind ? kind : "branch", NULL,
+						   *what ? what : "HEAD",
+						   "FETCH_HEAD");
 			}
 		}
 	}
@@ -1283,7 +1302,6 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 
  abort:
 	strbuf_release(&note);
-	free(url);
 	return rc;
 }
 
@@ -1331,7 +1349,8 @@ static int check_exist_and_connected(struct ref *ref_map)
 	return check_connected(iterate_ref_map, &rm, &opt);
 }
 
-static int fetch_and_consume_refs(struct transport *transport,
+static int fetch_and_consume_refs(struct display_state *display,
+				  struct transport *transport,
 				  struct ref_transaction *transaction,
 				  struct ref *ref_map,
 				  struct fetch_head *fetch_head)
@@ -1355,7 +1374,7 @@ static int fetch_and_consume_refs(struct transport *transport,
 	}
 
 	trace2_region_enter("fetch", "consume_refs", the_repository);
-	ret = store_updated_refs(transport->url, transport->remote->name,
+	ret = store_updated_refs(display, transport->remote->name,
 				 connectivity_checked, transaction, ref_map,
 				 fetch_head);
 	trace2_region_leave("fetch", "consume_refs", the_repository);
@@ -1365,31 +1384,17 @@ out:
 	return ret;
 }
 
-static int prune_refs(struct refspec *rs,
+static int prune_refs(struct display_state *display,
+		      struct refspec *rs,
 		      struct ref_transaction *transaction,
-		      struct ref *ref_map,
-		      const char *raw_url)
+		      struct ref *ref_map)
 {
-	int url_len, i, result = 0;
+	int result = 0;
 	struct ref *ref, *stale_refs = get_stale_heads(rs, ref_map);
 	struct strbuf err = STRBUF_INIT;
-	char *url;
 	const char *dangling_msg = dry_run
 		? _("   (%s will become dangling)")
 		: _("   (%s has become dangling)");
-
-	if (raw_url)
-		url = transport_anonymize_url(raw_url);
-	else
-		url = xstrdup("foreign");
-
-	url_len = strlen(url);
-	for (i = url_len - 1; url[i] == '/' && 0 <= i; i--)
-		;
-
-	url_len = i + 1;
-	if (4 < i && !strncmp(".git", url + i - 3, 4))
-		url_len = i - 3;
 
 	if (!dry_run) {
 		if (transaction) {
@@ -1411,26 +1416,15 @@ static int prune_refs(struct refspec *rs,
 	}
 
 	if (verbosity >= 0) {
-		int summary_width = transport_summary_width(stale_refs);
-
 		for (ref = stale_refs; ref; ref = ref->next) {
-			struct strbuf sb = STRBUF_INIT;
-			if (!shown_url) {
-				fprintf(stderr, _("From %.*s\n"), url_len, url);
-				shown_url = 1;
-			}
-			format_display(&sb, '-', _("[deleted]"), NULL,
-				       _("(none)"), prettify_refname(ref->name),
-				       summary_width);
-			fprintf(stderr, " %s\n",sb.buf);
-			strbuf_release(&sb);
+			display_ref_update(display, '-', _("[deleted]"), NULL,
+					   _("(none)"), ref->name);
 			warn_dangling_symref(stderr, dangling_msg, ref->name);
 		}
 	}
 
 cleanup:
 	strbuf_release(&err);
-	free(url);
 	free_refs(stale_refs);
 	return result;
 }
@@ -1545,7 +1539,8 @@ static struct transport *prepare_transport(struct remote *remote, int deepen)
 	return transport;
 }
 
-static int backfill_tags(struct transport *transport,
+static int backfill_tags(struct display_state *display,
+			 struct transport *transport,
 			 struct ref_transaction *transaction,
 			 struct ref *ref_map,
 			 struct fetch_head *fetch_head)
@@ -1569,7 +1564,7 @@ static int backfill_tags(struct transport *transport,
 	transport_set_option(transport, TRANS_OPT_FOLLOWTAGS, NULL);
 	transport_set_option(transport, TRANS_OPT_DEPTH, "0");
 	transport_set_option(transport, TRANS_OPT_DEEPEN_RELATIVE, NULL);
-	retcode = fetch_and_consume_refs(transport, transaction, ref_map, fetch_head);
+	retcode = fetch_and_consume_refs(display, transport, transaction, ref_map, fetch_head);
 
 	if (gsecondary) {
 		transport_disconnect(gsecondary);
@@ -1584,6 +1579,7 @@ static int do_fetch(struct transport *transport,
 {
 	struct ref_transaction *transaction = NULL;
 	struct ref *ref_map = NULL;
+	struct display_state display = { 0 };
 	int autotags = (transport->remote->fetch_tags == 1);
 	int retcode = 0;
 	const struct ref *remote_refs;
@@ -1665,6 +1661,8 @@ static int do_fetch(struct transport *transport,
 	if (retcode)
 		goto cleanup;
 
+	display_state_init(&display, ref_map, transport->url);
+
 	if (atomic_fetch) {
 		transaction = ref_transaction_begin(&err);
 		if (!transaction) {
@@ -1682,17 +1680,16 @@ static int do_fetch(struct transport *transport,
 		 * don't care whether --tags was specified.
 		 */
 		if (rs->nr) {
-			retcode = prune_refs(rs, transaction, ref_map, transport->url);
+			retcode = prune_refs(&display, rs, transaction, ref_map);
 		} else {
-			retcode = prune_refs(&transport->remote->fetch,
-					     transaction, ref_map,
-					     transport->url);
+			retcode = prune_refs(&display, &transport->remote->fetch,
+					     transaction, ref_map);
 		}
 		if (retcode != 0)
 			retcode = 1;
 	}
 
-	if (fetch_and_consume_refs(transport, transaction, ref_map, &fetch_head)) {
+	if (fetch_and_consume_refs(&display, transport, transaction, ref_map, &fetch_head)) {
 		retcode = 1;
 		goto cleanup;
 	}
@@ -1714,7 +1711,7 @@ static int do_fetch(struct transport *transport,
 			 * when `--atomic` is passed: in that case we'll abort
 			 * the transaction and don't commit anything.
 			 */
-			if (backfill_tags(transport, transaction, tags_ref_map,
+			if (backfill_tags(&display, transport, transaction, tags_ref_map,
 					  &fetch_head))
 				retcode = 1;
 		}
@@ -1797,6 +1794,7 @@ cleanup:
 		error("%s", err.buf);
 	}
 
+	display_state_release(&display);
 	close_fetch_head(&fetch_head);
 	strbuf_release(&err);
 	free_refs(ref_map);
